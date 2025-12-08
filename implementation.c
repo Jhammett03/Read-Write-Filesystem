@@ -11,6 +11,11 @@
 #define BLOCK_SIZE 4096
 #define INODE_CONTENT_SIZE 4028
 #define EXTENT_CONTENT_SIZE 4084
+#define DIRNAME_OFFSET 6
+#define DIR_INODE_OFFSET 2
+#define DIREXTENTS_DATA_SIZE 4088
+#define FILEEXTENTS_DATA_SIZE 4084
+
 
 //Block Type Magic Numbers
 #define TYPE_SUPERBLOCK 1
@@ -23,6 +28,50 @@
 typedef struct {
     int fd;
 } arg_t;
+
+struct Super
+{
+        uint32_t type;
+        uint32_t pattern[1021];
+        uint32_t root;
+        uint32_t free_head;
+}__attribute__((packed));
+
+struct Inode
+{
+        uint32_t type;
+        uint16_t mode;
+        uint16_t nlink;
+        uint32_t uid;
+        uint32_t gid;
+        uint32_t rdev;
+        uint32_t userflags;
+        uint32_t atime_s;
+        uint32_t atime_ns;
+        uint32_t mtime_s;
+        uint32_t mtime_ns;
+        uint32_t stime_s;
+        uint32_t stime_ns;
+        uint64_t size;
+        uint64_t numblocks;
+        uint8_t contents[INODE_CONTENT_SIZE];
+        uint32_t next;
+}__attribute__((packed));
+
+struct DirExtents
+{
+        uint32_t type;
+        uint8_t contents[DIREXTENTS_DATA_SIZE];
+        uint32_t next;
+}__attribute__((packed));
+
+struct FileExtents
+{
+        uint32_t type;
+        uint32_t inode;
+        uint8_t contents[FILEEXTENTS_DATA_SIZE];
+        uint32_t next;
+}__attribute__((packed));
 
 static uint32_t read_uint32(unsigned char *buf, int offset) {
     return *((uint32_t *)(buf + offset));
