@@ -389,13 +389,14 @@ static int rmdir_dir(void *state, uint32_t block_num, const char *name) {
         return -ENOTDIR;
     }
 
-    //find directory entry
+    //find directory entry in parent inode
     uint32_t target_inode = 0;
+    uint32_t found_block_num = block_num;  // Track which block has the entry
     int found_offset = -1;
     uint16_t found_len = 0;
     int offset = 64;
 
-    //check all names
+    //check all names in parent inode
     while (offset + 6 < 4092){
         uint16_t entry_len = read_uint16(block, offset);
         if (entry_len == 0) break;
@@ -408,6 +409,43 @@ static int rmdir_dir(void *state, uint32_t block_num, const char *name) {
             break;
         }
         offset += entry_len;
+    }
+
+    // if not found in inode, search parent's extent blocks
+    if (target_inode == 0) {
+        uint32_t next_extent = read_uint32(block, 4092);
+        
+        while (next_extent != 0) {
+            memset(block, 0, BLOCK_SIZE);
+            readblock(fs->fd, block, next_extent);
+            
+            type = read_uint32(block, 0);
+            if (type != TYPE_DIR_EXTENT) {
+                return -EIO;
+            }
+            
+            offset = 4;  // dir extents content starts at offset 4
+            while (offset + 6 < 4092) {
+                uint16_t entry_len = read_uint16(block, offset);
+                if (entry_len == 0) break;
+                
+                uint32_t entry_inode = read_uint32(block, offset + 2);
+                int name_len = entry_len - 6;
+                
+                if (strncmp((char *)(block + offset + 6), name, name_len) == 0 && 
+                    name[name_len] == '\0') {
+                    target_inode = entry_inode;
+                    found_block_num = next_extent;  // found in extent block
+                    found_offset = offset;
+                    found_len = entry_len;
+                    break;
+                }
+                offset += entry_len;
+            }
+            
+            if (target_inode != 0) break;  // found dir entry
+            next_extent = read_uint32(block, 4092);
+        }
     }
 
     if (target_inode == 0){
@@ -450,9 +488,9 @@ static int rmdir_dir(void *state, uint32_t block_num, const char *name) {
 
     //remove from parent dir
     memset(block, 0, BLOCK_SIZE);
-    readblock(fs->fd, block, block_num);
+    readblock(fs->fd, block, found_block_num);
     memset(block + found_offset, 0, found_len);
-    writeblock(fs->fd, block, block_num);
+    writeblock(fs->fd, block, found_block_num);
 
     return 0;
 }
@@ -475,17 +513,19 @@ static int unlink_file(void *state, uint32_t block_num, const char *name){
 
     //find file entry in parent dir
     uint32_t target_inode = 0;
+    uint32_t found_block_num = block_num;  // Track which block has the entry
     int found_offset = -1;
     uint16_t found_len = 0;
     int offset = 64;
 
+    // Search in parent inode
     while (offset + 6 < 4092){
         uint16_t entry_len = read_uint16(block, offset);
         if (entry_len == 0) break;
         uint32_t entry_inode = read_uint32(block, offset + 2);
         int name_len = entry_len - 6;
 
-        if (strncmp((char *)(block + offset + 6),name, name_len) == 0 && name[name_len] == '\0') {
+        if (strncmp((char *)(block + offset + 6), name, name_len) == 0 && name[name_len] == '\0') {
             target_inode = entry_inode;
             found_offset = offset;
             found_len = entry_len;
@@ -494,10 +534,46 @@ static int unlink_file(void *state, uint32_t block_num, const char *name){
         offset += entry_len;
     }
     
+    // If not found in inode, search parent's extent blocks
+    if (target_inode == 0) {
+        uint32_t next_extent = read_uint32(block, 4092);
+        
+        while (next_extent != 0) {
+            memset(block, 0, BLOCK_SIZE);
+            readblock(fs->fd, block, next_extent);
+            
+            type = read_uint32(block, 0);
+            if (type != TYPE_DIR_EXTENT) {
+                return -EIO;
+            }
+            
+            offset = 4;  // Dir extents content starts at offset 4
+            while (offset + 6 < 4092) {
+                uint16_t entry_len = read_uint16(block, offset);
+                if (entry_len == 0) break;
+                
+                uint32_t entry_inode = read_uint32(block, offset + 2);
+                int name_len = entry_len - 6;
+                
+                if (strncmp((char *)(block + offset + 6), name, name_len) == 0 && 
+                    name[name_len] == '\0') {
+                    target_inode = entry_inode;
+                    found_block_num = next_extent;  // Found in extent block
+                    found_offset = offset;
+                    found_len = entry_len;
+                    break;
+                }
+                offset += entry_len;
+            }
+            
+            if (target_inode != 0) break;  // Found it, exit loop
+            next_extent = read_uint32(block, 4092);
+        }
+    }
+    
     if (target_inode == 0) {
         return -ENOENT; // not found
     }
-
 
     //read file's inode
     unsigned char target_block[BLOCK_SIZE];
@@ -540,11 +616,11 @@ static int unlink_file(void *state, uint32_t block_num, const char *name){
 
     writeblock(fs->fd, target_block, target_inode);
 
-    //remove from parent dir
+    //remove from parent dir (could be in inode or extent block)
     memset(block, 0, BLOCK_SIZE);
-    readblock(fs->fd, block, block_num);
+    readblock(fs->fd, block, found_block_num);
     memset(block + found_offset, 0, found_len);
-    writeblock(fs->fd, block, block_num);
+    writeblock(fs->fd, block, found_block_num);
 
     return 0;
 }
