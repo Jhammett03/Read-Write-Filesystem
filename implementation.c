@@ -1485,6 +1485,226 @@ int myrename(void *state, uint32_t old_parent, const char *old_name, uint32_t ne
 	return 0;
 }
 
+int addblock(void *state, uint32_t parentinode, uint32_t parent_block){
+	arg_t *fs = (arg_t*)state;
+	uint32_t curr_time = (uint32_t)time(NULL);
+	unsigned char pblock[BLOCK_SIZE];
+	unsigned char sblock[BLOCK_SIZE];
+	unsigned char fblock[BLOCK_SIZE];
+	unsigned char iblock[BLOCK_SIZE];
+	readblock(fs->fd, pblock, parent_block);
+	readblock(fs->fd, iblock, parentinode);
+	readblock(fs->fd, sblock, 0);
+	struct Super* super = (struct Super*)(sblock);
+	if(super->type != 1){
+		fprintf(stderr, "ERROR addblock() failed: super block corrupted");
+		return -EIO;
+	}
+	if(super->free_head == 0){
+		fprintf(stderr, "ERROR addblock() failed: no free blocks");
+		return -ENOSPC;
+	}
+	uint32_t newbnum = super->free_head;
+	readblock(fs->fd, fblock, newbnum);
+	struct Free* free = (struct Free*)(fblock);
+	super->free_head = free->next;
+	writeblock(fs->fd, (unsigned char*)super, 0);
+	struct FileExtents* newextent = (struct FileExtents*)(fblock);
+	newextent->next = 0;
+	newextent->type = 4;
+	newextent->inode = parentinode;
+	memset(newextent->contents, 0 , FILEEXTENTS_DATA_SIZE);
+	writeblock(fs->fd, (unsigned char *)newextent, newbnum);
+
+	if(parentinode == parent_block){
+		struct Inode* inode = (struct Inode*)(iblock);
+		if(inode->type != 2){
+			fprintf(stderr, "ERROR addblock() failed: parent_block %u is not an inode and should be", parentinode);
+			return -EINVAL;
+		}
+		inode->next = newbnum;
+		inode->mtime_s = curr_time;
+		inode->mtime_ns = 0;
+		inode->stime_s = curr_time;
+		inode->stime_ns = 0;
+		inode->numblocks++;
+		writeblock(fs->fd, (unsigned char*)inode, parentinode);
+	} else {
+		struct FileExtents* extents = (struct FileExtents*)(pblock);
+		if(extents->type != 4){
+			fprintf(stderr, "ERROR addblock() failed: parent_block %u is not an extents and should be", parent_block);
+			return -EINVAL;
+		}
+		struct Inode* inode = (struct Inode*)(iblock);
+		if(inode->type != 2){
+			fprintf(stderr, "ERROR addblock() failed: parentinode %u is not an inode and should be", parentinode);
+			return -EINVAL;
+		}
+		extents->next = newbnum;
+		inode->mtime_s = curr_time;
+		inode->mtime_ns = 0;
+		inode->stime_s = curr_time;
+		inode->stime_ns = 0;
+		inode->numblocks++;
+		writeblock(fs->fd, (unsigned char*)inode, parentinode);
+		writeblock(fs->fd, (unsigned char*)extents, parent_block);
+	}
+	return 0;
+}
+
+int freeextents(void *state, uint32_t bnum){
+	arg_t *fs = (arg_t*)state;
+	unsigned char block[BLOCK_SIZE];
+	readblock(fs->fd, block, bnum);
+	struct FileExtents* extents = (struct FileExtents*)(block);
+	if(extents->type != 4){
+		fprintf(stderr, "ERROR freeextents() failed: block_num %u is not a File Extents", bnum);
+		return -EINVAL;
+	}
+	if(extents->next != 0){
+		int res = freeextents(state, extents->next);
+		if(res < 0){
+			return res;
+		}
+	}
+	unsigned char sblock[BLOCK_SIZE];
+	readblock(fs->fd, sblock, 0);
+	struct Super* super = (struct Super*)(sblock);
+	if(super->type != 1){
+		fprintf(stderr, "ERROR freeextents() failed: super block corrupted");
+		return -EIO;
+	}
+	struct Free* free = (struct Free*)(block);
+	free->type = 5;
+	free->next = super->free_head;
+	super->free_head = bnum;
+	writeblock(fs->fd, (unsigned char *)free, bnum);
+	writeblock(fs->fd, (unsigned char *)super , 0);
+	return 0;
+}
+
+int mytruncate(void *state, uint32_t block_num, off_t new_size){
+	arg_t *fs = (arg_t *)state;
+    unsigned char block[BLOCK_SIZE];
+    readblock(fs->fd, block, block_num);
+	struct Inode *inode = (struct Inode*)(block);
+    if(inode->type != 2){
+		fprintf(stderr, "ERROR truncate() failed: block_num %u is not an Inode, type= %u", block_num, inode->type);
+		return -EINVAL;
+    }
+	if((inode->mode & S_IFMT) != S_IFREG){
+		fprintf(stderr, "ERROR truncate() failed: block_num %u is not a FILE, mode= %u", block_num, inode->mode);
+		return -ENOTDIR;
+	}
+
+	unsigned char superblock[BLOCK_SIZE];
+	readblock(fs->fd, superblock, 0);
+	struct Super *super = (struct Super*)(superblock);
+	if(super->type != 1){
+		fprintf(stderr, "ERROR truncate() failed: superblock corrupted");
+		return -EIO;
+	}
+	if(new_size == inode->size){
+		writeblock(fs->fd, (unsigned char*)inode, block_num);
+		return 0;
+	}
+	int res;
+	if(new_size < inode->size){
+		if(new_size <= INODE_CONTENT_SIZE){
+			if(inode->next != 0){
+				res = freeextents(state, inode->next);
+				if(res < 0){
+					fprintf(stderr, "ERROR truncate() failed due to freeextents()");
+					return res;
+				}
+				inode->next = 0;
+				inode->numblocks = 1;
+			}
+		} else {
+			int remainingsize = new_size - INODE_CONTENT_SIZE;
+			int blocks_to_travel = (remainingsize + FILEEXTENTS_DATA_SIZE - 1) / FILEEXTENTS_DATA_SIZE;
+			int blockskept = blocks_to_travel;
+			unsigned char eblock[BLOCK_SIZE];
+			struct FileExtents* extents = (struct FileExtents*)(eblock);
+			uint32_t ebnum = inode->next;
+			uint32_t prev = 0;
+			while(blocks_to_travel != 0){
+				readblock(fs->fd, eblock, ebnum);
+				prev = ebnum;
+				ebnum = extents->next;
+				blocks_to_travel--;
+			}
+			if(extents->next != 0){
+				uint32_t freestart = extents->next;
+				extents->next = 0;
+				writeblock(fs->fd, (unsigned char*)extents, prev);
+				res = freeextents(state, freestart);
+				if(res < 0){
+					fprintf(stderr, "ERROR truncate() failed due to freeextents()");
+					return res;
+				}	
+			}
+			inode->numblocks = 1 + blockskept;
+		}
+	} else if(new_size > inode->size){
+		uint32_t blocks_needed = 1;
+		if(new_size > INODE_CONTENT_SIZE){
+			off_t extra = new_size - INODE_CONTENT_SIZE;
+			blocks_needed += (extra + FILEEXTENTS_DATA_SIZE - 1) / FILEEXTENTS_DATA_SIZE;
+		}
+		uint32_t currentblocks = inode->numblocks;
+		if(currentblocks == 0){
+			//should never get here but sanity check
+			currentblocks = 1;
+		}
+		if(blocks_needed > currentblocks){
+			int to_add = blocks_needed - currentblocks;
+			uint32_t tail;
+			unsigned char eblock[BLOCK_SIZE];
+			struct FileExtents *extents;
+			extents = (struct FileExtents*)(eblock);
+			while(to_add > 0){
+				if(inode->next == 0){
+					res = addblock(state, block_num, block_num);
+					if(res < 0){
+						fprintf(stderr, "ERROR truncate() failed due to addblock()");
+						return res;
+					}
+				} else {
+					tail = inode->next;
+					while(1){
+						readblock(fs->fd, eblock, tail);
+						if(extents->type != 4){
+							fprintf(stderr, "ERROR truncate() failed: %u is not a File Extents", tail);
+							return -EINVAL;
+						}
+						if(extents->next == 0){
+							break;
+						}
+						tail = extents->next;
+					}
+					res = addblock(state, block_num, tail);
+					if(res < 0){
+						fprintf(stderr, "ERROR truncate() failed due to addblock()");
+						return res;					
+					}
+				}
+				readblock(fs->fd, block, block_num);
+				inode = (struct Inode*)block;
+				to_add--;
+			}
+		}
+	}
+	inode->size = new_size;
+	uint32_t curr_time = (uint32_t)time(NULL);
+	inode->mtime_s = curr_time;
+	inode->mtime_ns = 0;
+	inode->stime_s = curr_time;
+	inode->stime_ns = 0;
+	writeblock(fs->fd, (unsigned char*)inode, block_num);
+	return 0;
+}
+
 struct cpe453fs_ops *CPE453_get_operations(void) {
     static struct cpe453fs_ops ops;
     static arg_t args;
@@ -1510,5 +1730,6 @@ struct cpe453fs_ops *CPE453_get_operations(void) {
 	ops.mkdir = mkdir_file;
 	ops.link = mylink;
 	ops.rename = myrename;
+	ops.truncate = mytruncate;
     return &ops;
 }
