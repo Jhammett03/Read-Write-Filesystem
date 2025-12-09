@@ -637,7 +637,7 @@ static int mknod_file(void *state, uint32_t parent_block, const char *name, mode
     return 0;
 }
 
-int findExistingName(void* state, uint32_t parent_block, const char *name){
+int32_t findExistingName(void* state, uint32_t parent_block, const char *name){
 	arg_t *fs = (arg_t*)state;
 	unsigned char iblock[BLOCK_SIZE];
 	readblock(fs->fd, iblock, parent_block);
@@ -653,14 +653,16 @@ int findExistingName(void* state, uint32_t parent_block, const char *name){
 	int curr_offset = 0;
 	uint16_t entrylen;
 	int namelen = strlen(name);
+	int32_t targetinode;
 	while(curr_offset < INODE_CONTENT_SIZE - 7){
 		entrylen = *(uint16_t*)&inode->contents[curr_offset];
+		targetinode = *(int32_t*)&inode->contents[curr_offset + DIR_INODE_OFFSET];
 		if(entrylen == 0){
 			break;
 		}
 		if(namelen == entrylen - 6){
 			if(memcmp(name, &inode->contents[curr_offset + DIRNAME_OFFSET], namelen) == 0){
-				return 1;
+				return targetinode;
 			}
 		}
 		curr_offset += entrylen;
@@ -679,12 +681,13 @@ int findExistingName(void* state, uint32_t parent_block, const char *name){
 		}
 		while(curr_offset < DIREXTENTS_DATA_SIZE - 7){
 			entrylen = *(uint16_t*)&extents->contents[curr_offset];
+			targetinode = *(int32_t*)&extents->contents[curr_offset + DIR_INODE_OFFSET];
 			if(entrylen == 0){
 				break;
 			}
 			if(namelen == entrylen - 6){
 				if(memcmp(name, &extents->contents[curr_offset + DIRNAME_OFFSET], namelen) == 0){
-					return 1;
+					return targetinode;
 				}
 			}
 			curr_offset += entrylen;
@@ -729,7 +732,7 @@ static int symlink_file(void* state, uint32_t parent_block, const char *name, co
 	}
 
 	int res = findExistingName(state, parent_block, name);
-	if(res == 1){
+	if(res > 0){
 		return -EEXIST;
 	} else if (res < 0){
 		return res;
@@ -883,7 +886,7 @@ static int mkdir_file(void* state, uint32_t parent_block, const char *name, mode
 	}
 
 	int res = findExistingName(state, parent_block, name);
-	if(res == 1){
+	if(res > 0){
 		return -EEXIST;
 	} else if (res < 0){
 		return res;
@@ -1031,7 +1034,7 @@ int mylink(void *state, uint32_t parent_block, const char *name, uint32_t dest_b
 	}
 
 	int res = findExistingName(state, parent_block, name);
-	if(res == 1){
+	if(res > 0){
 		return -EEXIST;
 	} else if (res < 0){
 		return res;
@@ -1125,13 +1128,16 @@ int mylink(void *state, uint32_t parent_block, const char *name, uint32_t dest_b
 			extentsblocknum = extents->next;
 		}
 	}
+	writeblock(fs->fd, (unsigned char *)super, 0);
 	writeblock(fs->fd, (unsigned char*)destinode, dest_block);
 	return 0;
 }
 
 int findAndRemoveName(void* state, uint32_t parent_block, const char *name){
+	//returns the removed entries inode if found
 	arg_t *fs = (arg_t*)state;
 	unsigned char iblock[BLOCK_SIZE];
+	uint32_t curr_time = (uint32_t)time(NULL);
 	readblock(fs->fd, iblock, parent_block);
 	struct Inode *inode = (struct Inode*)(iblock);
 	if(inode->type != 2){
@@ -1157,8 +1163,11 @@ int findAndRemoveName(void* state, uint32_t parent_block, const char *name){
 				bytestomove = INODE_CONTENT_SIZE - (curr_offset + entrylen);
 				memmove(&inode->contents[curr_offset], &inode->contents[curr_offset + entrylen], bytestomove);
 				memset(&inode->contents[curr_offset + bytestomove], 0, entrylen);
+				inode->size -= entrylen;
+				inode->mtime_s = curr_time;
+				inode->mtime_ns = 0;
 				writeblock(fs->fd, (unsigned char *)inode, parent_block);
-				return 1;
+				return 0;
 			}
 		}
 		curr_offset += entrylen;
@@ -1186,7 +1195,11 @@ int findAndRemoveName(void* state, uint32_t parent_block, const char *name){
 					memmove(&extents->contents[curr_offset], &extents->contents[curr_offset + entrylen], bytestomove);
 					memset(&extents->contents[curr_offset + bytestomove], 0, entrylen);
 					writeblock(fs->fd, (unsigned char*)extents, nextblock);
-					return 1;
+					inode->size -= entrylen;
+					inode->mtime_s = curr_time;
+					inode->mtime_ns = 0;
+					writeblock(fs->fd, (unsigned char*)inode, parent_block);
+					return 0;
 				}
 			}
 			curr_offset += entrylen;
@@ -1199,7 +1212,133 @@ int findAndRemoveName(void* state, uint32_t parent_block, const char *name){
 
 
 int myrename(void *state, uint32_t old_parent, const char *old_name, uint32_t new_parent, const char *new_name){
+	arg_t *fs = (arg_t *)state;
+    unsigned char oldblock[BLOCK_SIZE];
+    readblock(fs->fd, oldblock, old_parent);
+	struct Inode *oldinode = (struct Inode*)(oldblock);
+    if(oldinode->type != 2){
+		fprintf(stderr, "ERROR rename() failed: parent_block %u is not an Inode, type= %u", old_parent, oldinode->type);
+		return -EINVAL;
+    }
+	if((oldinode->mode & S_IFMT) != S_IFDIR){
+		fprintf(stderr, "ERROR rename() failed: parent_block %u is not an Directory, mode= %u", old_parent, oldinode->mode);
+		return -ENOTDIR;
+	}
+    unsigned char newblock[BLOCK_SIZE];
+    readblock(fs->fd, newblock, new_parent);
+	struct Inode *newinode = (struct Inode*)(newblock);
+    if(newinode->type != 2){
+		fprintf(stderr, "ERROR rename() failed: parent_block %u is not an Inode, type= %u", new_parent, newinode->type);
+		return -EINVAL;
+    }
+	if((newinode->mode & S_IFMT) != S_IFDIR){
+		fprintf(stderr, "ERROR rename() failed: parent_block %u is not an Directory, mode= %u", new_parent, newinode->mode);
+		return -ENOTDIR;
+	}
+
+	int res = findExistingName(state, new_parent, new_name);
+	if(res > 0){
+		return -EEXIST;
+	} else if (res < 0){
+		return res;
+	}
+
+	int32_t found = findExistingName(state, old_parent, old_name);
+	if(found < 0){
+		return found;
+	}
+
+	uint32_t child = (uint32_t)found;
 	
+	int namelen = strlen(new_name);
+	int totallen = namelen + 6;
+	if(totallen > DIREXTENTS_DATA_SIZE){
+		fprintf(stderr, "ERROR rename() failed: name too long");
+		return -ENAMETOOLONG;
+	}
+
+	int slotfound = 0;
+	uint32_t curr_time = (uint32_t)time(NULL);
+	int ret = insert_in_dir(newinode->contents, INODE_CONTENT_SIZE, totallen, child, new_name, namelen);
+	if(ret == 1){
+		slotfound = 1;
+		newinode->mtime_s = curr_time;
+		newinode->mtime_ns = 0;
+		newinode->size += totallen;
+		writeblock(fs->fd, (unsigned char*)newinode, new_parent);
+	}
+	uint32_t extentsblocknum = newinode->next;
+	uint32_t previousblock = 0;
+	unsigned char eblock[BLOCK_SIZE];
+	unsigned char peblock[BLOCK_SIZE];
+	unsigned char sblock[BLOCK_SIZE];
+	struct Free *free_extents;
+	struct DirExtents *extents;
+	struct DirExtents *prev;
+	struct Super *super;
+	readblock(fs->fd, sblock, 0);
+	super = (struct Super*)(sblock);
+
+	while(slotfound == 0){
+		if(extentsblocknum == 0){
+			extentsblocknum = super->free_head;
+			if(extentsblocknum == 0){
+				fprintf(stderr, "ERROR rename() failed: no free blocks");
+				return -ENOSPC;
+			}
+			readblock(fs->fd, eblock, extentsblocknum);
+			free_extents = (struct Free*)(eblock);
+			if(free_extents->type != 5){
+				fprintf(stderr, "ERROR rename() failed: free list corrupted");
+				return -EIO;
+			}
+			extents = (struct DirExtents*)(eblock);
+			super->free_head = extents->next;
+			memset(extents->contents, 0, DIREXTENTS_DATA_SIZE);
+			extents->type = 3;
+			extents->next = 0;
+			if(previousblock == 0){
+				newinode->next = extentsblocknum;
+				newinode->mtime_s = curr_time;
+				newinode->mtime_ns = 0;
+				writeblock(fs->fd, (unsigned char*)newinode, new_parent);
+			} else {
+				readblock(fs->fd, peblock, previousblock);
+				prev = (struct DirExtents*)(peblock);
+				prev->next = extentsblocknum;
+				writeblock(fs->fd, (unsigned char*)prev, previousblock);
+			}
+		} else {
+			readblock(fs->fd, eblock, extentsblocknum);
+			extents = (struct DirExtents*)(eblock);
+		}
+		if(extents->type != 3){
+			fprintf(stderr, "ERROR rename() failed: extents is not a directory extents");
+			return -EINVAL;
+		}
+
+		ret = insert_in_dir(extents->contents, DIREXTENTS_DATA_SIZE, totallen, child, new_name, namelen);
+		if(ret == 1){
+			slotfound = 1;
+			writeblock(fs->fd, (unsigned char*)extents, extentsblocknum);
+			newinode->mtime_s = curr_time;
+			newinode->mtime_ns = 0;
+			newinode->size += totallen;
+			writeblock(fs->fd, (unsigned char*)newinode, new_parent);
+		} else {
+			previousblock = extentsblocknum;
+			extentsblocknum = extents->next;
+		}
+	}
+
+	res = findAndRemoveName(state, old_parent, old_name);
+	if(res < 0){
+		fprintf(stderr, "ERROR rename() failed: old_name doesn't exist in old parent block");
+		return res;
+	}
+
+	writeblock(fs->fd, (unsigned char *)super, 0);
+	return 0;
 }
 
 struct cpe453fs_ops *CPE453_get_operations(void) {
@@ -1226,5 +1365,6 @@ struct cpe453fs_ops *CPE453_get_operations(void) {
 	ops.symlink = symlink_file;
 	ops.mkdir = mkdir_file;
 	ops.link = mylink;
+	ops.rename = myrename;
     return &ops;
 }
