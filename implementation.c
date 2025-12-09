@@ -134,6 +134,8 @@ static int getattr(void *state, uint32_t block_num, struct stat *stbuf) {
     return 0;
 }
 
+static int findAndRemoveName(void* state, uint32_t parent_block, const char *name);
+
 //helper for parsing directory entries in a block
 static void parse_dir_entries(unsigned char *contents, int content_start, 
 int max_offset, void *buf, CPE453_readdir_callback_t cb) {
@@ -500,13 +502,10 @@ static int rmdir_dir(void *state, uint32_t block_num, const char *name) {
     parent = (struct Inode *)block;
     
     uint32_t cur_time = (uint32_t)time(NULL);
-    int name_len = strlen(name);
-    uint16_t entry_len = 6 + name_len;
     
     parent->mtime_s = cur_time;
     parent->mtime_ns = 0;
     parent->nlink--;
-    parent->size -= entry_len;
     
     writeblock(fs->fd, (unsigned char *)parent, block_num);
 
@@ -652,14 +651,8 @@ static int unlink_file(void *state, uint32_t block_num, const char *name){
     readblock(fs->fd, block, block_num);
     parent = (struct Inode *)block;
     
-    int name_len = strlen(name);
-    uint16_t entry_len = 6 + name_len;
-    
     parent->mtime_s = cur_time;
     parent->mtime_ns = 0;
-    
-    // decrease parent directory size
-    parent->size -= entry_len;
     
     writeblock(fs->fd, (unsigned char *)parent, block_num);
 
@@ -1705,6 +1698,201 @@ int mytruncate(void *state, uint32_t block_num, off_t new_size){
 	return 0;
 }
 
+static int write_file(void *state, uint32_t block_num, const char *buff, size_t wr_len, off_t wr_offset){
+    arg_t *fs = (arg_t *)state;
+    unsigned char block[BLOCK_SIZE];
+    size_t bytes_written = 0;
+    off_t current_offset = wr_offset;
+    int is_first_block = 1;
+    unsigned char current_block[BLOCK_SIZE];
+    uint32_t current_block_num = block_num;
+    uint64_t new_size;
+    uint64_t blocks_needed;
+    uint64_t i;
+    
+    memset(block, 0, BLOCK_SIZE);
+    readblock(fs->fd, block, block_num);
+
+    struct Inode *inode = (struct Inode *)block;
+
+    // make sure its a regular inode
+    if (inode->type != TYPE_INODE){
+        return -ENOENT;
+    }
+    if(!S_ISREG(inode->mode)) {
+        return -EISDIR;
+    }
+
+    new_size = wr_offset + wr_len;
+    
+    // check if we need to expand the file
+    if (new_size > inode->size){
+        if (new_size <= INODE_CONTENT_SIZE) {
+            blocks_needed = 1;
+        }
+        else {
+            blocks_needed = 1 + ((new_size - INODE_CONTENT_SIZE + FILEEXTENTS_DATA_SIZE - 1) / FILEEXTENTS_DATA_SIZE);
+        }
+
+        if (blocks_needed > inode->numblocks){
+            unsigned char superblock[BLOCK_SIZE];
+            readblock(fs->fd, superblock, 0);
+            struct Super *super = (struct Super *)superblock;
+
+            uint32_t last_block = block_num;
+            uint32_t cur = inode->next;
+
+            while (cur != 0) {
+                last_block = cur;
+                unsigned char temp_block[BLOCK_SIZE];
+                readblock(fs->fd, temp_block, cur);
+                struct FileExtents *extent = (struct FileExtents *)temp_block;
+                cur = extent->next;
+            }
+
+            // allocate new blocks
+            for (i = inode->numblocks; i < blocks_needed; i++) {
+                if (super->free_head == 0) {
+                    return -ENOSPC;
+                }
+
+                uint32_t new_block_num = super->free_head;
+                unsigned char new_block[BLOCK_SIZE];
+                memset(new_block, 0, BLOCK_SIZE);
+                readblock(fs->fd, new_block, new_block_num);
+                struct Free *free_block = (struct Free *)new_block;
+                super->free_head = free_block->next;
+
+                struct FileExtents *new_extent = (struct FileExtents *)new_block;
+                new_extent->type = TYPE_FILE_EXTENT;
+                new_extent->inode = block_num;
+                new_extent->next = 0;
+                memset(new_extent->contents, 0, FILEEXTENTS_DATA_SIZE);
+                writeblock(fs->fd, new_block, new_block_num);
+
+                if (last_block == block_num) {
+                    inode->next = new_block_num;
+                    writeblock(fs->fd, (unsigned char *)inode, block_num);
+                }
+                else {
+                    unsigned char temp_block[BLOCK_SIZE];
+                    readblock(fs->fd, temp_block, last_block);
+                    struct FileExtents *extent = (struct FileExtents *)temp_block;
+                    extent->next = new_block_num;
+                    writeblock(fs->fd, temp_block, last_block);
+                }
+
+                last_block = new_block_num;
+            }
+            
+            writeblock(fs->fd, superblock, 0);
+        }
+        
+        // update inode size and numblocks
+        memset(block, 0, BLOCK_SIZE);
+        readblock(fs->fd, block, block_num);
+        inode = (struct Inode *)block;
+        inode->size = new_size;
+        inode->numblocks = blocks_needed;
+        writeblock(fs->fd, (unsigned char *)inode, block_num);
+    }
+
+    // reload inode
+    memset(block, 0, BLOCK_SIZE);
+    readblock(fs->fd, block, block_num);
+    inode = (struct Inode *)block;
+
+    memcpy(current_block, block, BLOCK_SIZE);
+    
+    // skip to the correct block based on offset
+    if (current_offset >= INODE_CONTENT_SIZE) {
+        current_offset -= INODE_CONTENT_SIZE;
+        current_block_num = inode->next;
+
+        // skip through extent blocks
+        while(current_block_num != 0 && current_offset >= FILEEXTENTS_DATA_SIZE) {
+            current_offset -= FILEEXTENTS_DATA_SIZE;
+            memset(current_block, 0, BLOCK_SIZE);
+            readblock(fs->fd, current_block, current_block_num);
+            struct FileExtents *extent = (struct FileExtents *)current_block;
+            current_block_num = extent->next;
+        }
+
+        if (current_block_num != 0) {
+            memset(current_block, 0, BLOCK_SIZE);
+            readblock(fs->fd, current_block, current_block_num);
+            is_first_block = 0;
+        }
+    }
+
+    // write data across blocks
+    while(bytes_written < wr_len) {
+        int content_start;
+        int content_size;
+
+        if(is_first_block) {
+            content_start = 64;
+            content_size = INODE_CONTENT_SIZE;
+        }
+        else {
+            content_start = 8;
+            content_size = FILEEXTENTS_DATA_SIZE;
+        }
+
+        int available = content_size - current_offset;
+        int to_write;
+        if (wr_len - bytes_written < available) {
+            to_write = wr_len - bytes_written;
+        }
+        else {
+            to_write = available;
+        }
+
+        // copy data into block
+        memcpy(current_block + content_start + current_offset, buff + bytes_written, to_write);
+        
+        // write block back to disk
+        writeblock(fs->fd, current_block, current_block_num);
+
+        bytes_written += to_write;
+        current_offset = 0;
+
+        // move to next block if needed
+        if (bytes_written < wr_len) {
+            if (is_first_block) {
+                current_block_num = inode->next;
+            }
+            else {
+                struct FileExtents *extent = (struct FileExtents *)current_block;
+                current_block_num = extent->next;
+            }
+
+            if (current_block_num == 0) {
+                break; // shouldn't happen
+            }
+
+            memset(current_block, 0, BLOCK_SIZE);
+            readblock(fs->fd, current_block, current_block_num);
+            is_first_block = 0;
+        }
+    }
+    
+    // update inode time
+    memset(block, 0, BLOCK_SIZE);
+    readblock(fs->fd, block, block_num);
+    inode = (struct Inode *)block;
+    
+    uint32_t cur_time = (uint32_t)time(NULL);
+    inode->mtime_s = cur_time;
+    inode->mtime_ns = 0;
+    inode->stime_s = cur_time;
+    inode->stime_ns = 0;
+
+    writeblock(fs->fd, (unsigned char *)inode, block_num);
+    
+    return bytes_written;
+}
+
 struct cpe453fs_ops *CPE453_get_operations(void) {
     static struct cpe453fs_ops ops;
     static arg_t args;
@@ -1731,5 +1919,6 @@ struct cpe453fs_ops *CPE453_get_operations(void) {
 	ops.link = mylink;
 	ops.rename = myrename;
 	ops.truncate = mytruncate;
+    ops.write = write_file;
     return &ops;
 }
