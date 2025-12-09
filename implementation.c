@@ -1011,23 +1011,6 @@ static int mkdir_file(void* state, uint32_t parent_block, const char *name, mode
 	new_inode->next = 0;
 	memset(new_inode->contents, 0, INODE_CONTENT_SIZE);
 
-	int offset = 0;
-	uint16_t entrylen;
-	const char *dot = ".";
-	const char * dotdot = "..";
-	entrylen = 7;
-	*(uint16_t *)&new_inode->contents[offset] = entrylen;
-	*(uint32_t *)&new_inode->contents[offset + DIR_INODE_OFFSET] = freeblock_num;
-	memcpy(&new_inode->contents[offset + DIRNAME_OFFSET], dot, 1);
-	offset += 7;
-	entrylen = 8;
-	*(uint16_t *)&new_inode->contents[offset] = entrylen;
-	*(uint32_t *)&new_inode->contents[offset + DIR_INODE_OFFSET] = parent_block;
-	memcpy(&new_inode->contents[offset + DIRNAME_OFFSET], dotdot, 2); 
-	offset += 8;	
-	
-	new_inode->size = offset;
-
 	int namelen = strlen(name);
 	int totallen = namelen + 6;
 	if(totallen > DIREXTENTS_DATA_SIZE){
@@ -1042,7 +1025,7 @@ static int mkdir_file(void* state, uint32_t parent_block, const char *name, mode
 		inode->mtime_s = curr_time;
 		inode->mtime_ns = 0;
 		inode->size += totallen;
-		inode->nlink ++;
+		inode->nlink++;
 		writeblock(fs->fd, (unsigned char*)inode, parent_block);
 	}
 	uint32_t extentsblocknum = inode->next;
@@ -1097,7 +1080,7 @@ static int mkdir_file(void* state, uint32_t parent_block, const char *name, mode
 			inode->mtime_s = curr_time;
 			inode->mtime_ns = 0;
 			inode->size += totallen;
-			inode->nlink ++;
+			inode->nlink++;
 			writeblock(fs->fd, (unsigned char*)inode, parent_block);
 		} else {
 			previousblock = extentsblocknum;
@@ -1107,6 +1090,192 @@ static int mkdir_file(void* state, uint32_t parent_block, const char *name, mode
 	writeblock(fs->fd, (unsigned char*)new_inode, freeblock_num);
 	writeblock(fs->fd, (unsigned char*)super, 0);
 	return 0;
+}
+
+int mylink(void *state, uint32_t parent_block, const char *name, uint32_t dest_block){
+	arg_t *fs = (arg_t *)state;
+    unsigned char block[BLOCK_SIZE];
+    readblock(fs->fd, block, parent_block);
+	struct Inode *inode = (struct Inode*)(block);
+    if(inode->type != 2){
+		fprintf(stderr, "ERROR link() failed: parent_block %u is not an Inode, type= %u", parent_block, inode->type);
+		return -EINVAL;
+    }
+	if((inode->mode & S_IFMT) != S_IFDIR){
+		fprintf(stderr, "ERROR link() failed: parent_block %u is not an Directory, mode= %u", parent_block, inode->mode);
+		return -ENOTDIR;
+	}
+
+	int res = findExistingName(state, parent_block, name);
+	if(res == 1){
+		return -EEXIST;
+	} else if (res < 0){
+		return res;
+	}
+	unsigned char dblock[BLOCK_SIZE];
+	readblock(fs->fd, dblock, dest_block);
+	struct Inode *destinode = (struct Inode*)(dblock);
+	if(destinode->type != 2){
+		fprintf(stderr, "ERROR link() failed: dest_block %u is not an Inode, type= %u", dest_block, destinode->type);
+		return -EINVAL;
+	}
+	destinode->nlink++;
+	
+	int namelen = strlen(name);
+	int totallen = namelen + 6;
+	if(totallen > DIREXTENTS_DATA_SIZE){
+		fprintf(stderr, "ERROR link() failed: name too long");
+		return -ENAMETOOLONG;
+	}
+ 
+	int slotfound = 0;
+	uint32_t curr_time = (uint32_t)time(NULL);
+	int ret = insert_in_dir(inode->contents, INODE_CONTENT_SIZE, totallen, dest_block, name, namelen);
+	if(ret == 1){
+		slotfound = 1;
+		inode->mtime_s = curr_time;
+		inode->mtime_ns = 0;
+		inode->size += totallen;
+		writeblock(fs->fd, (unsigned char*)inode, parent_block);
+	}
+	uint32_t extentsblocknum = inode->next;
+	uint32_t previousblock = 0;
+	unsigned char eblock[BLOCK_SIZE];
+	unsigned char peblock[BLOCK_SIZE];
+	unsigned char sblock[BLOCK_SIZE];
+	struct Free *free_extents;
+	struct DirExtents *extents;
+	struct DirExtents *prev;
+	struct Super *super;
+	readblock(fs->fd, sblock, 0);
+	super = (struct Super*)(sblock);
+
+	while(slotfound == 0){
+		if(extentsblocknum == 0){
+			extentsblocknum = super->free_head;
+			if(extentsblocknum == 0){
+				fprintf(stderr, "ERROR link() failed: no free blocks");
+				return -ENOSPC;
+			}
+			readblock(fs->fd, eblock, extentsblocknum);
+			free_extents = (struct Free*)(eblock);
+			if(free_extents->type != 5){
+				fprintf(stderr, "ERROR link() failed: free list corrupted");
+				return -EIO;
+			}
+			extents = (struct DirExtents*)(eblock);
+			super->free_head = extents->next;
+			memset(extents->contents, 0, DIREXTENTS_DATA_SIZE);
+			extents->type = 3;
+			extents->next = 0;
+			if(previousblock == 0){
+				inode->next = extentsblocknum;
+				inode->mtime_s = curr_time;
+				inode->mtime_ns = 0;
+				writeblock(fs->fd, (unsigned char*)inode, parent_block);
+			} else {
+				readblock(fs->fd, peblock, previousblock);
+				prev = (struct DirExtents*)(peblock);
+				prev->next = extentsblocknum;
+				writeblock(fs->fd, (unsigned char*)prev, previousblock);
+			}
+		} else {
+			readblock(fs->fd, eblock, extentsblocknum);
+			extents = (struct DirExtents*)(eblock);
+		}
+		if(extents->type != 3){
+			fprintf(stderr, "ERROR link() failed: extents is not a directory extents");
+			return -EINVAL;
+		}
+
+		ret = insert_in_dir(extents->contents, DIREXTENTS_DATA_SIZE, totallen, dest_block, name, namelen);
+		if(ret == 1){
+			slotfound = 1;
+			writeblock(fs->fd, (unsigned char*)extents, extentsblocknum);
+			inode->mtime_s = curr_time;
+			inode->mtime_ns = 0;
+			inode->size += totallen;
+			writeblock(fs->fd, (unsigned char*)inode, parent_block);
+		} else {
+			previousblock = extentsblocknum;
+			extentsblocknum = extents->next;
+		}
+	}
+	writeblock(fs->fd, (unsigned char*)destinode, dest_block);
+	return 0;
+}
+
+int findAndRemoveName(void* state, uint32_t parent_block, const char *name){
+	arg_t *fs = (arg_t*)state;
+	unsigned char iblock[BLOCK_SIZE];
+	readblock(fs->fd, iblock, parent_block);
+	struct Inode *inode = (struct Inode*)(iblock);
+	if(inode->type != 2){
+		fprintf(stderr, "ERROR findAndRemoveName() failed: %u is not an Inode, type= %u", parent_block, inode->type);
+		return -EINVAL;
+	}
+	if((inode->mode & S_IFMT) != S_IFDIR){
+		fprintf(stderr, "ERROR findFindAndRemoveName() failed: parent_block %u is not an Directory, mode= %u", parent_block, inode->mode);
+		return -ENOTDIR;
+	}
+	int curr_offset = 0;
+	uint16_t entrylen;
+	int namelen = strlen(name);
+	int bytestomove;
+	while(curr_offset < INODE_CONTENT_SIZE - 7){
+		entrylen = *(uint16_t*)&inode->contents[curr_offset];
+		if(entrylen == 0){
+			break;
+		}
+		if(namelen == entrylen - 6){
+			if(memcmp(name, &inode->contents[curr_offset + DIRNAME_OFFSET], namelen) == 0){
+				//move the rest of the blocks contents up
+				bytestomove = INODE_CONTENT_SIZE - (curr_offset + entrylen);
+				memmove(&inode->contents[curr_offset], &inode->contents[curr_offset + entrylen], bytestomove);
+				memset(&inode->contents[curr_offset + bytestomove], 0, entrylen);
+				writeblock(fs->fd, (unsigned char *)inode, parent_block);
+				return 1;
+			}
+		}
+		curr_offset += entrylen;
+	}
+
+	unsigned char eblock[BLOCK_SIZE];
+	struct DirExtents *extents;
+	uint32_t nextblock = inode->next;
+	while(nextblock != 0){
+		curr_offset = 0;
+		readblock(fs->fd, eblock, nextblock);
+		extents = (struct DirExtents*)(eblock);
+		if(extents->type != 3){
+			fprintf(stderr, "ERROR findFindAndRemoveName() failed: block is not Directory Extents");
+			return -EIO;
+		}
+		while(curr_offset < DIREXTENTS_DATA_SIZE - 7){
+			entrylen = *(uint16_t*)&extents->contents[curr_offset];
+			if(entrylen == 0){
+				break;
+			}
+			if(namelen == entrylen - 6){
+				if(memcmp(name, &extents->contents[curr_offset + DIRNAME_OFFSET], namelen) == 0){
+					bytestomove = DIREXTENTS_DATA_SIZE - (curr_offset + entrylen);
+					memmove(&extents->contents[curr_offset], &extents->contents[curr_offset + entrylen], bytestomove);
+					memset(&extents->contents[curr_offset + bytestomove], 0, entrylen);
+					writeblock(fs->fd, (unsigned char*)extents, nextblock);
+					return 1;
+				}
+			}
+			curr_offset += entrylen;
+		}
+		nextblock = extents->next;
+	}
+	fprintf(stderr, "ERROR findAndRemoveName() failed: target does not exist");
+	return -ENOENT;
+}
+
+
+int myrename(void *state, uint32_t old_parent, const char *old_name, uint32_t new_parent, const char *new_name){
+	
 }
 
 struct cpe453fs_ops *CPE453_get_operations(void) {
@@ -1132,5 +1301,6 @@ struct cpe453fs_ops *CPE453_get_operations(void) {
     ops.mknod = mknod_file;
 	ops.symlink = symlink_file;
 	ops.mkdir = mkdir_file;
+	ops.link = mylink;
     return &ops;
 }
