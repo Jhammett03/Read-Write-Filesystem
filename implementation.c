@@ -79,6 +79,8 @@ struct FileExtents
         uint32_t next;
 }__attribute__((packed));
 
+int findAndRemoveName(void* state, uint32_t parent_block, const char *name);
+
 static uint32_t read_uint32(unsigned char *buf, int offset) {
     return *((uint32_t *)(buf + offset));
 }
@@ -943,6 +945,8 @@ static int symlink_file(void* state, uint32_t parent_block, const char *name, co
 				inode->next = extentsblocknum;
 				inode->mtime_s = curr_time;
 				inode->mtime_ns = 0;
+				inode->stime_s = curr_time;
+				inode->stime_ns = 0;
 				writeblock(fs->fd, (unsigned char*)inode, parent_block);
 			} else {
 				readblock(fs->fd, peblock, previousblock);
@@ -965,6 +969,8 @@ static int symlink_file(void* state, uint32_t parent_block, const char *name, co
 			writeblock(fs->fd, (unsigned char*)extents, extentsblocknum);
 			inode->mtime_s = curr_time;
 			inode->mtime_ns = 0;
+			inode->stime_s = curr_time;
+			inode->stime_ns = 0;
 			inode->size += totallen;
 			writeblock(fs->fd, (unsigned char*)inode, parent_block);
 		} else {
@@ -1062,6 +1068,8 @@ static int mkdir_file(void* state, uint32_t parent_block, const char *name, mode
 		inode->mtime_ns = 0;
 		inode->size += totallen;
 		inode->nlink++;
+		inode->stime_s = curr_time;
+		inode->stime_ns = 0;
 		writeblock(fs->fd, (unsigned char*)inode, parent_block);
 	}
 	uint32_t extentsblocknum = inode->next;
@@ -1093,6 +1101,8 @@ static int mkdir_file(void* state, uint32_t parent_block, const char *name, mode
 				inode->next = extentsblocknum;
 				inode->mtime_s = curr_time;
 				inode->mtime_ns = 0;
+				inode->stime_s = curr_time;
+				inode->stime_ns = 0;
 				writeblock(fs->fd, (unsigned char*)inode, parent_block);
 			} else {
 				readblock(fs->fd, peblock, previousblock);
@@ -1117,6 +1127,8 @@ static int mkdir_file(void* state, uint32_t parent_block, const char *name, mode
 			inode->mtime_ns = 0;
 			inode->size += totallen;
 			inode->nlink++;
+			inode->mtime_s = curr_time;
+			inode->mtime_ns = 0;
 			writeblock(fs->fd, (unsigned char*)inode, parent_block);
 		} else {
 			previousblock = extentsblocknum;
@@ -1172,6 +1184,8 @@ int mylink(void *state, uint32_t parent_block, const char *name, uint32_t dest_b
 		inode->mtime_s = curr_time;
 		inode->mtime_ns = 0;
 		inode->size += totallen;
+		inode->stime_s = curr_time;
+		inode->stime_ns = 0;
 		writeblock(fs->fd, (unsigned char*)inode, parent_block);
 	}
 	uint32_t extentsblocknum = inode->next;
@@ -1208,6 +1222,8 @@ int mylink(void *state, uint32_t parent_block, const char *name, uint32_t dest_b
 				inode->next = extentsblocknum;
 				inode->mtime_s = curr_time;
 				inode->mtime_ns = 0;
+				inode->stime_s = curr_time;
+				inode->stime_ns = 0;
 				writeblock(fs->fd, (unsigned char*)inode, parent_block);
 			} else {
 				readblock(fs->fd, peblock, previousblock);
@@ -1231,6 +1247,8 @@ int mylink(void *state, uint32_t parent_block, const char *name, uint32_t dest_b
 			inode->mtime_s = curr_time;
 			inode->mtime_ns = 0;
 			inode->size += totallen;
+			inode->stime_s = curr_time;
+			inode->stime_ns = 0;
 			writeblock(fs->fd, (unsigned char*)inode, parent_block);
 		} else {
 			previousblock = extentsblocknum;
@@ -1275,6 +1293,8 @@ int findAndRemoveName(void* state, uint32_t parent_block, const char *name){
 				inode->size -= entrylen;
 				inode->mtime_s = curr_time;
 				inode->mtime_ns = 0;
+				inode->stime_s = curr_time;
+				inode->stime_ns = 0;
 				writeblock(fs->fd, (unsigned char *)inode, parent_block);
 				return 0;
 			}
@@ -1307,6 +1327,8 @@ int findAndRemoveName(void* state, uint32_t parent_block, const char *name){
 					inode->size -= entrylen;
 					inode->mtime_s = curr_time;
 					inode->mtime_ns = 0;
+					inode->stime_s = curr_time;
+					inode->stime_ns = 0;
 					writeblock(fs->fd, (unsigned char*)inode, parent_block);
 					return 0;
 				}
@@ -1374,6 +1396,8 @@ int myrename(void *state, uint32_t old_parent, const char *old_name, uint32_t ne
 		newinode->mtime_s = curr_time;
 		newinode->mtime_ns = 0;
 		newinode->size += totallen;
+		newinode->stime_s = curr_time;	
+		newinode->stime_ns = 0;
 		writeblock(fs->fd, (unsigned char*)newinode, new_parent);
 	}
 	uint32_t extentsblocknum = newinode->next;
@@ -1410,6 +1434,8 @@ int myrename(void *state, uint32_t old_parent, const char *old_name, uint32_t ne
 				newinode->next = extentsblocknum;
 				newinode->mtime_s = curr_time;
 				newinode->mtime_ns = 0;
+				newinode->stime_s = curr_time;
+				newinode->stime_ns = 0;
 				writeblock(fs->fd, (unsigned char*)newinode, new_parent);
 			} else {
 				readblock(fs->fd, peblock, previousblock);
@@ -1432,6 +1458,8 @@ int myrename(void *state, uint32_t old_parent, const char *old_name, uint32_t ne
 			writeblock(fs->fd, (unsigned char*)extents, extentsblocknum);
 			newinode->mtime_s = curr_time;
 			newinode->mtime_ns = 0;
+			newinode->stime_s = curr_time;
+			newinode->stime_ns = 0;
 			newinode->size += totallen;
 			writeblock(fs->fd, (unsigned char*)newinode, new_parent);
 		} else {
