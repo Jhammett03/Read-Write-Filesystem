@@ -380,32 +380,26 @@ static int rmdir_dir(void *state, uint32_t block_num, const char *name) {
     readblock(fs->fd, block, block_num);
 
     //parent must be directory inode
-    uint32_t type = read_uint32(block, 0);
-    if (type != TYPE_INODE) {
+    struct Inode *parent = (struct Inode *)block;
+    if (parent->type != TYPE_INODE) {
         return -ENOTDIR;
     }
-    uint32_t mode = read_uint32(block, 4);
-    if (!S_ISDIR(mode)){
+    if (!S_ISDIR(parent->mode)){
         return -ENOTDIR;
     }
 
-    //find directory entry in parent inode
+    // find directory entry in parent inode
     uint32_t target_inode = 0;
-    uint32_t found_block_num = block_num;  // Track which block has the entry
-    int found_offset = -1;
-    uint16_t found_len = 0;
-    int offset = 64;
+    int offset = 0;
 
-    //check all names in parent inode
-    while (offset + 6 < 4092){
-        uint16_t entry_len = read_uint16(block, offset);
+    // check all names in parent inode
+    while (offset + 6 < INODE_CONTENT_SIZE){
+        uint16_t entry_len = read_uint16(parent->contents, offset);
         if (entry_len == 0) break;
-        uint32_t entry_inode = read_uint32(block, offset + 2);
+        uint32_t entry_inode = read_uint32(parent->contents, offset + 2);
         int name_len = entry_len - 6;
-        if (strncmp((char *)(block + offset + 6), name, name_len) == 0 && name[name_len] == '\0') {
+        if (strncmp((char *)(parent->contents + offset + 6), name, name_len) == 0 && name[name_len] == '\0') {
             target_inode = entry_inode;
-            found_offset = offset;
-            found_len = entry_len;
             break;
         }
         offset += entry_len;
@@ -413,84 +407,106 @@ static int rmdir_dir(void *state, uint32_t block_num, const char *name) {
 
     // if not found in inode, search parent's extent blocks
     if (target_inode == 0) {
-        uint32_t next_extent = read_uint32(block, 4092);
+        uint32_t next_extent = parent->next;
         
         while (next_extent != 0) {
-            memset(block, 0, BLOCK_SIZE);
-            readblock(fs->fd, block, next_extent);
+            unsigned char eblock[BLOCK_SIZE];
+            memset(eblock, 0, BLOCK_SIZE);
+            readblock(fs->fd, eblock, next_extent);
             
-            type = read_uint32(block, 0);
-            if (type != TYPE_DIR_EXTENT) {
+            struct DirExtents *extents = (struct DirExtents *)eblock;
+            if (extents->type != TYPE_DIR_EXTENT) {
                 return -EIO;
             }
             
-            offset = 4;  // dir extents content starts at offset 4
-            while (offset + 6 < 4092) {
-                uint16_t entry_len = read_uint16(block, offset);
+            offset = 0;
+            while (offset + 6 < DIREXTENTS_DATA_SIZE) {
+                uint16_t entry_len = read_uint16(extents->contents, offset);
                 if (entry_len == 0) break;
                 
-                uint32_t entry_inode = read_uint32(block, offset + 2);
+                uint32_t entry_inode = read_uint32(extents->contents, offset + 2);
                 int name_len = entry_len - 6;
                 
-                if (strncmp((char *)(block + offset + 6), name, name_len) == 0 && 
+                if (strncmp((char *)(extents->contents + offset + 6), name, name_len) == 0 && 
                     name[name_len] == '\0') {
                     target_inode = entry_inode;
-                    found_block_num = next_extent;  // found in extent block
-                    found_offset = offset;
-                    found_len = entry_len;
                     break;
                 }
                 offset += entry_len;
             }
             
-            if (target_inode != 0) break;  // found dir entry
-            next_extent = read_uint32(block, 4092);
+            if (target_inode != 0) break;
+            next_extent = extents->next;
         }
     }
 
     if (target_inode == 0){
-        return -ENOENT; //not found
+        return -ENOENT;
     }
 
-    //read the directory's inode
+    // read the directory's inode
     unsigned char target_block[BLOCK_SIZE];
     memset(target_block, 0, BLOCK_SIZE);
     readblock(fs->fd, target_block, target_inode);
 
-    //make sure its a directory
-    uint32_t target_type = read_uint32(target_block, 0);
-    if (target_type != TYPE_INODE) {
+    struct Inode *target = (struct Inode *)target_block;
+    
+    // make sure it's a directory
+    if (target->type != TYPE_INODE) {
         return -ENOENT;
     }
-    uint32_t target_mode = read_uint32(target_block, 4);
-    if (!S_ISDIR(target_mode)) {
+    if (!S_ISDIR(target->mode)) {
         return -ENOTDIR;
     }
 
-    //empty check
-    int check_offset = 64;
-    while (check_offset + 6 < 4092){
-        uint16_t entry_len = read_uint16(target_block, check_offset);
+    // empty check
+    int check_offset = 0;
+    while (check_offset + 6 < INODE_CONTENT_SIZE){
+        uint16_t entry_len = read_uint16(target->contents, check_offset);
         if (entry_len == 0) {
             break;
         }
         return -ENOTEMPTY;
     }
-    //make sure there are no extent blocks
-    uint32_t target_next = read_uint32(target_block, 4092);
-    if (target_next != 0) {
+    
+    // make sure there are no extent blocks
+    if (target->next != 0) {
         return -ENOTEMPTY;
     }
 
-    //free inode
-    *((uint32_t *)target_block) = TYPE_FREE;
-    writeblock(fs->fd, target_block, target_inode);
+    // free inode and add to free list
+    unsigned char superblock[BLOCK_SIZE];
+    readblock(fs->fd, superblock, 0);
+    struct Super *super = (struct Super *)superblock;
 
-    //remove from parent dir
+    target->type = TYPE_FREE;
+    ((struct Free *)target)->next = super->free_head;
+    super->free_head = target_inode;
+
+    writeblock(fs->fd, (unsigned char *)target, target_inode);
+    writeblock(fs->fd, superblock, 0);
+
+    // remove from parent dir
+    int result = findAndRemoveName(state, block_num, name);
+    if (result < 0) {
+        return result;
+    }
+
+    // update parent directory mtime, nlink, and size
     memset(block, 0, BLOCK_SIZE);
-    readblock(fs->fd, block, found_block_num);
-    memset(block + found_offset, 0, found_len);
-    writeblock(fs->fd, block, found_block_num);
+    readblock(fs->fd, block, block_num);
+    parent = (struct Inode *)block;
+    
+    uint32_t cur_time = (uint32_t)time(NULL);
+    int name_len = strlen(name);
+    uint16_t entry_len = 6 + name_len;
+    
+    parent->mtime_s = cur_time;
+    parent->mtime_ns = 0;
+    parent->nlink--;
+    parent->size -= entry_len;
+    
+    writeblock(fs->fd, (unsigned char *)parent, block_num);
 
     return 0;
 }
@@ -501,126 +517,149 @@ static int unlink_file(void *state, uint32_t block_num, const char *name){
     memset(block, 0, BLOCK_SIZE);
     readblock(fs->fd, block, block_num);
 
-    //parent must be directory inode
-    uint32_t type = read_uint32(block, 0);
-    if (type != TYPE_INODE){
+    // parent must be directory inode
+    struct Inode *parent = (struct Inode *)block;
+    if (parent->type != TYPE_INODE){
         return -ENOTDIR;
     }
-    uint32_t mode = read_uint32(block, 4);
-    if (!S_ISDIR(mode)){
+    if (!S_ISDIR(parent->mode)){
         return -ENOTDIR;
     }
 
-    //find file entry in parent dir
+    // find file entry in parent dir
     uint32_t target_inode = 0;
-    uint32_t found_block_num = block_num;  // Track which block has the entry
-    int found_offset = -1;
-    uint16_t found_len = 0;
-    int offset = 64;
+    int offset = 0;
 
-    // Search in parent inode
-    while (offset + 6 < 4092){
-        uint16_t entry_len = read_uint16(block, offset);
+    while (offset + 6 < INODE_CONTENT_SIZE){
+        uint16_t entry_len = read_uint16(parent->contents, offset);
         if (entry_len == 0) break;
-        uint32_t entry_inode = read_uint32(block, offset + 2);
+        uint32_t entry_inode = read_uint32(parent->contents, offset + 2);
         int name_len = entry_len - 6;
 
-        if (strncmp((char *)(block + offset + 6), name, name_len) == 0 && name[name_len] == '\0') {
+        if (strncmp((char *)(parent->contents + offset + 6), name, name_len) == 0 && name[name_len] == '\0') {
             target_inode = entry_inode;
-            found_offset = offset;
-            found_len = entry_len;
             break;
         }
         offset += entry_len;
     }
     
-    // If not found in inode, search parent's extent blocks
+    // if not found in inode, search parent's extent blocks
     if (target_inode == 0) {
-        uint32_t next_extent = read_uint32(block, 4092);
+        uint32_t next_extent = parent->next;
         
         while (next_extent != 0) {
-            memset(block, 0, BLOCK_SIZE);
-            readblock(fs->fd, block, next_extent);
+            unsigned char eblock[BLOCK_SIZE];
+            memset(eblock, 0, BLOCK_SIZE);
+            readblock(fs->fd, eblock, next_extent);
             
-            type = read_uint32(block, 0);
-            if (type != TYPE_DIR_EXTENT) {
+            struct DirExtents *extents = (struct DirExtents *)eblock;
+            if (extents->type != TYPE_DIR_EXTENT) {
                 return -EIO;
             }
             
-            offset = 4;  // Dir extents content starts at offset 4
-            while (offset + 6 < 4092) {
-                uint16_t entry_len = read_uint16(block, offset);
+            offset = 0;
+            while (offset + 6 < DIREXTENTS_DATA_SIZE) {
+                uint16_t entry_len = read_uint16(extents->contents, offset);
                 if (entry_len == 0) break;
                 
-                uint32_t entry_inode = read_uint32(block, offset + 2);
+                uint32_t entry_inode = read_uint32(extents->contents, offset + 2);
                 int name_len = entry_len - 6;
                 
-                if (strncmp((char *)(block + offset + 6), name, name_len) == 0 && 
+                if (strncmp((char *)(extents->contents + offset + 6), name, name_len) == 0 && 
                     name[name_len] == '\0') {
                     target_inode = entry_inode;
-                    found_block_num = next_extent;  // Found in extent block
-                    found_offset = offset;
-                    found_len = entry_len;
                     break;
                 }
                 offset += entry_len;
             }
             
-            if (target_inode != 0) break;  // Found it, exit loop
-            next_extent = read_uint32(block, 4092);
+            if (target_inode != 0) break;
+            next_extent = extents->next;
         }
     }
     
     if (target_inode == 0) {
-        return -ENOENT; // not found
+        return -ENOENT;
     }
 
-    //read file's inode
+    // read file's inode
     unsigned char target_block[BLOCK_SIZE];
     memset(target_block, 0, BLOCK_SIZE);
     readblock(fs->fd, target_block, target_inode);
 
-    //make sure its an inode
-    uint32_t target_type = read_uint32(target_block, 0);
-    if (target_type != TYPE_INODE) {
+    struct Inode *target = (struct Inode *)target_block;
+    
+    // make sure it's an inode
+    if (target->type != TYPE_INODE) {
         return -ENOENT;
     }
-    uint32_t target_mode = read_uint32(target_block, 4);
-    if (S_ISDIR(target_mode)) {
+    if (S_ISDIR(target->mode)) {
         return -EISDIR;
     }
 
-    //find link count
-    uint16_t nlinks = read_uint16(target_block, 6);
-    //decrement links
-    nlinks--;
-    *((uint16_t *)(target_block + 6)) = nlinks;
+    uint32_t cur_time = (uint32_t)time(NULL);
+    target->nlink--;
 
-    //if nlinks == 0 free inode and extents
-    if (nlinks == 0){
-        uint32_t next_extent = read_uint32(target_block, 4092);
+    // update ctime on target file
+    target->stime_s = cur_time;
+    target->stime_ns = 0;
+
+    if (target->nlink == 0){
+        // read superblock for free list management
+        unsigned char superblock[BLOCK_SIZE];
+        readblock(fs->fd, superblock, 0);
+        struct Super *super = (struct Super *)superblock;
+        
+        uint32_t next_extent = target->next;
         while (next_extent != 0){
             unsigned char extent_block[BLOCK_SIZE];
             memset(extent_block, 0, BLOCK_SIZE);
             readblock(fs->fd, extent_block, next_extent);
-            uint32_t next = read_uint32(extent_block, 4092);
+            
+            struct FileExtents *extent = (struct FileExtents *)extent_block;
+            uint32_t next = extent->next;
 
-            //mark extent as free
-            *((uint32_t *)extent_block) = TYPE_FREE;
+            // add extent to free list
+            struct Free *free_blk = (struct Free *)extent_block;
+            free_blk->type = TYPE_FREE;
+            free_blk->next = super->free_head;
+            super->free_head = next_extent;
             writeblock(fs->fd, extent_block, next_extent);
+            
             next_extent = next;
         }
-        //mark inode as free
-        *((uint32_t *)target_block) = TYPE_FREE;
+        
+        // add inode to free list
+        target->type = TYPE_FREE;
+        ((struct Free *)target)->next = super->free_head;
+        super->free_head = target_inode;
+        
+        // write updated superblock
+        writeblock(fs->fd, superblock, 0);
     }
 
-    writeblock(fs->fd, target_block, target_inode);
+    writeblock(fs->fd, (unsigned char *)target, target_inode);
 
-    //remove from parent dir (could be in inode or extent block)
+    int result = findAndRemoveName(state, block_num, name);
+    if (result < 0) {
+        return result;
+    }
+
+    // update parent directory mtime and size
     memset(block, 0, BLOCK_SIZE);
-    readblock(fs->fd, block, found_block_num);
-    memset(block + found_offset, 0, found_len);
-    writeblock(fs->fd, block, found_block_num);
+    readblock(fs->fd, block, block_num);
+    parent = (struct Inode *)block;
+    
+    int name_len = strlen(name);
+    uint16_t entry_len = 6 + name_len;
+    
+    parent->mtime_s = cur_time;
+    parent->mtime_ns = 0;
+    
+    // decrease parent directory size
+    parent->size -= entry_len;
+    
+    writeblock(fs->fd, (unsigned char *)parent, block_num);
 
     return 0;
 }
@@ -1007,6 +1046,7 @@ static int mkdir_file(void* state, uint32_t parent_block, const char *name, mode
 	new_inode->mtime_ns = 0;
 	new_inode->stime_s = curr_time;
 	new_inode->stime_ns = 0;
+    new_inode->size = 0;
 	new_inode->numblocks = 1;
 	new_inode->next = 0;
 	memset(new_inode->contents, 0, INODE_CONTENT_SIZE);
