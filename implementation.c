@@ -89,6 +89,33 @@ static uint16_t read_uint16(unsigned char *buf, int offset) {
   return *((uint16_t *)(buf + offset));
 }
 
+static uint32_t allocate_block(void *state){
+	arg_t *fs = (arg_t *)state;
+	unsigned char block[BLOCK_SIZE];
+	unsigned char fblock[BLOCK_SIZE];
+	memset(block, 0, BLOCK_SIZE);
+	memset(fblock, 0, BLOCK_SIZE);
+	struct Super* super = (struct Super*)(block);
+	struct Free* new = (struct Free*)(fblock);
+	readblock(fs->fd, super, 0);
+	if(super->type != 1){
+		fprintf(stderr, "ERROR allocate_block failed, superblock corrupted");
+		return -EIO;
+	}
+	if(super->free_head != 0){
+		uint32_t newbnum = super->free_head;
+		readblock(fs->fd, fblock, newbnum);
+		super->free_head = new->next;
+		writeblock(fs->fd, super, 0);
+		return newbnum;
+	}
+	off_t filesize = lseek(fd, 0, SEEK_END);
+	uint32_t new_block = filesize / BLOCK_SIZE;
+	new->type = 5;
+	writeblock(fs->fd, new, new_block);
+	return new_block;
+}
+
 static void set_file_descriptor(void *state, int fd) {
   arg_t *fs = (arg_t *)state;
   fs->fd = fd;
