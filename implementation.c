@@ -97,22 +97,28 @@ static uint32_t allocate_block(void *state){
 	memset(fblock, 0, BLOCK_SIZE);
 	struct Super* super = (struct Super*)(block);
 	struct Free* new = (struct Free*)(fblock);
-	readblock(fs->fd, super, 0);
+	readblock(fs->fd, block, 0);
 	if(super->type != 1){
-		fprintf(stderr, "ERROR allocate_block failed, superblock corrupted");
+		fprintf(stderr, "ERROR allocate_block() failed, superblock corrupted");
 		return -EIO;
 	}
 	if(super->free_head != 0){
 		uint32_t newbnum = super->free_head;
 		readblock(fs->fd, fblock, newbnum);
 		super->free_head = new->next;
-		writeblock(fs->fd, super, 0);
+		writeblock(fs->fd, (unsigned char*)super, 0);
 		return newbnum;
 	}
-	off_t filesize = lseek(fd, 0, SEEK_END);
+	struct stat file_info;
+	if(fstat(fs->fd, &file_info) == -1){
+		fprintf(stderr, "ERROR allocate_block() failed: fstat error");
+		return -EIO;
+	}
+	uint32_t filesize = file_info.st_size;
 	uint32_t new_block = filesize / BLOCK_SIZE;
 	new->type = 5;
-	writeblock(fs->fd, new, new_block);
+	new->next = 0;
+	writeblock(fs->fd, (unsigned char*)new, new_block);
 	return new_block;
 }
 
