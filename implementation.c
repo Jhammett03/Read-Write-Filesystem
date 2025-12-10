@@ -79,8 +79,6 @@ struct FileExtents
         uint32_t next;
 }__attribute__((packed));
 
-int findAndRemoveName(void* state, uint32_t parent_block, const char *name);
-
 static uint32_t read_uint32(unsigned char *buf, int offset) {
     return *((uint32_t *)(buf + offset));
 }
@@ -134,7 +132,7 @@ static int getattr(void *state, uint32_t block_num, struct stat *stbuf) {
     return 0;
 }
 
-static int findAndRemoveName(void* state, uint32_t parent_block, const char *name);
+int findAndRemoveName(void* state, uint32_t parent_block, const char *name);
 
 //helper for parsing directory entries in a block
 static void parse_dir_entries(unsigned char *contents, int content_start, 
