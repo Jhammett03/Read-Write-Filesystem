@@ -115,7 +115,7 @@ static int32_t allocate_block(void *state){
 		return -EIO;
 	}
 	uint32_t filesize = file_info.st_size;
-	uint32_t new_block = filesize / BLOCK_SIZE;
+	uint32_t new_block = (filesize / BLOCK_SIZE) + 1;
 	new->type = 5;
 	new->next = 0;
 	writeblock(fs->fd, (unsigned char*)new, new_block);
@@ -1959,7 +1959,7 @@ int mytruncate(void *state, uint32_t block_num, off_t new_size){
   inode->mtime_ns = 0;
   inode->stime_s = curr_time;
   inode->stime_ns = 0;
-	writeblock(fs->fd, (unsigned char*)inode, block_num);
+  writeblock(fs->fd, (unsigned char*)inode, block_num);
   return 0;
 }
 
