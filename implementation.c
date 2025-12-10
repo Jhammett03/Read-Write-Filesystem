@@ -89,7 +89,7 @@ static uint16_t read_uint16(unsigned char *buf, int offset) {
   return *((uint16_t *)(buf + offset));
 }
 
-static uint32_t allocate_block(void *state){
+static int32_t allocate_block(void *state){
 	arg_t *fs = (arg_t *)state;
 	unsigned char block[BLOCK_SIZE];
 	unsigned char fblock[BLOCK_SIZE];
